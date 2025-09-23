@@ -110,4 +110,331 @@
       <section class="card">
         <label class="h">
           <strong>候補リスト</strong>
-          <span class="counts" id="counts">0
+          <span class="counts" id="counts">0 件（ユニーク 0）</span>
+        </label>
+        <textarea id="input" placeholder="1行に1つずつ入力してください（例）
+山田 太郎
+佐藤 花子
+鈴木 一郎
+..."></textarea>
+        <div class="tips">
+          <div>区切り: 改行 / カンマ / タブ を自動判別</div>
+          <div><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Enter</kbd> で抽選</div>
+          <div><kbd>Ctrl</kbd>/<kbd>Shift</kbd> + <kbd>Enter</kbd> で再抽選</div>
+        </div>
+      </section>
+
+      <aside class="card">
+        <div class="row">
+          <div class="g num">
+            <label for="n">当選人数</label>
+            <input id="n" type="number" min="1" step="1" value="1" />
+          </div>
+          <div class="g num">
+            <label for="seed">シード（任意）</label>
+            <input id="seed" type="text" placeholder="同じ結果を再現したい場合" />
+          </div>
+        </div>
+
+        <div class="opts">
+          <label class="chk"><input id="trim" type="checkbox" checked /> 先頭末尾の空白をトリム</label>
+          <label class="chk"><input id="skipEmpty" type="checkbox" checked /> 空行・空白のみの行を無視</label>
+          <label class="chk"><input id="dedup" type="checkbox" /> 入力の重複を除去（ユニーク化）</label>
+          <label class="chk"><input id="allowDupWin" type="checkbox" /> 同一候補の重複当選を許可</label>
+          <label class="chk"><input id="persist" type="checkbox" checked /> ブラウザに自動保存（ローカルのみ）</label>
+        </div>
+
+        <div id="msg"></div>
+
+        <div class="btns">
+          <button class="primary" id="drawBtn">抽選する</button>
+          <button class="success" id="redrawBtn">もう一度</button>
+          <button class="subtle" id="copyBtn">結果をコピー</button>
+          <button class="danger" id="clearBtn">入力をクリア</button>
+        </div>
+        <div class="foot stat" id="stat"></div>
+      </aside>
+    </div>
+
+    <section class="card" style="margin-top:14px">
+      <label class="h">
+        <strong>結果</strong>
+        <span class="small" id="seedInfo"></span>
+      </label>
+      <div class="result" id="result">
+        <div class="placeholder" id="placeholder">ここに結果が表示されます</div>
+        <div class="winners" id="winners" hidden></div>
+        <div class="confetti" id="confetti" aria-hidden="true"></div>
+      </div>
+    </section>
+  </div>
+
+<script>
+(()=> {
+  "use strict";
+
+  // DOM refs
+  const $ = id => document.getElementById(id);
+  const input = $("input");
+  const counts = $("counts");
+  const msg = $("msg");
+  const winnersBox = $("winners");
+  const resultBox = $("result");
+  const placeholder = $("placeholder");
+  const confettiBox = $("confetti");
+  const nEl = $("n");
+  const seedEl = $("seed");
+  const seedInfo = $("seedInfo");
+  const trimEl = $("trim");
+  const skipEmptyEl = $("skipEmpty");
+  const dedupEl = $("dedup");
+  const allowDupWinEl = $("allowDupWin");
+  const persistEl = $("persist");
+  const drawBtn = $("drawBtn");
+  const redrawBtn = $("redrawBtn");
+  const copyBtn = $("copyBtn");
+  const clearBtn = $("clearBtn");
+  const stat = $("stat");
+
+  const LS_KEY = "simple-lottery-v1";
+
+  /** Utility: crypto-safe random */
+  function rand32() {
+    const a = new Uint32Array(1);
+    self.crypto.getRandomValues(a);
+    return a[0] / 0xffffffff;
+  }
+
+  /** xorshift32 for deterministic PRNG (seeded) */
+  function xs32(seed) {
+    let x = seed >>> 0 || 123456789;
+    return () => {
+      x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+      return ((x >>> 0) / 0xffffffff);
+    };
+  }
+
+  /** hash string to 32-bit int */
+  function hash32(str) {
+    let h = 2166136261 >>> 0;
+    for (let i=0; i<str.length; i++){
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+
+  /** Fisher-Yates shuffle using RNG */
+  function shuffle(arr, rng=Math.random){
+    for (let i=arr.length-1; i>0; i--){
+      const j = Math.floor(rng()*(i+1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  /** Parse textarea into items */
+  function parseItems(raw){
+    let text = raw;
+    if (trimEl.checked) text = text.replace(/\r/g,"").split("\n").map(s=>s.trim()).join("\n");
+    // Split by newline / comma / tab
+    let items = text.split(/[\n,\t]+/).map(s => trimEl.checked ? s.trim() : s);
+    if (skipEmptyEl.checked) items = items.filter(s => s && /\S/.test(s));
+    const total = items.length;
+    if (dedupEl.checked){
+      const seen = new Set();
+      items = items.filter(s => (s = s.trim(), !seen.has(s) && seen.add(s)));
+    }
+    const unique = new Set(items).size;
+    return { items, total, unique };
+  }
+
+  /** Update counts/stat */
+  function refreshCounts(){
+    const { total, unique } = parseItems(input.value);
+    counts.textContent = `${total} 件（ユニーク ${unique}）`;
+    stat.textContent = "";
+  }
+
+  /** Show message */
+  function showMsg(text, ok=false){
+    msg.innerHTML = text ? `<div class="${ok?'ok':'error'}">${escapeHtml(text)}</div>` : "";
+  }
+
+  /** Escape HTML */
+  function escapeHtml(s){
+    return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  /** Save/Load */
+  function save(){
+    if (!persistEl.checked) return;
+    const data = {
+      v:1,
+      text: input.value,
+      n: nEl.value,
+      trim: trimEl.checked,
+      skip: skipEmptyEl.checked,
+      dedup: dedupEl.checked,
+      dupwin: allowDupWinEl.checked
+    };
+    try { localStorage.setItem(LS_KEY, JSON.stringify(data)); } catch{}
+  }
+  function load(){
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (!raw) return;
+      const d = JSON.parse(raw);
+      if (d.v === 1){
+        input.value = d.text ?? "";
+        nEl.value = d.n ?? 1;
+        trimEl.checked = !!d.trim;
+        skipEmptyEl.checked = d.skip ?? true;
+        dedupEl.checked = !!d.dedup;
+        allowDupWinEl.checked = !!d.dupwin;
+      }
+    } catch {}
+    refreshCounts();
+  }
+
+  /** Confetti */
+  function launchConfetti(){
+    confettiBox.innerHTML = "";
+    const colors = ["#60a5fa","#34d399","#f472b6","#f59e0b","#a78bfa","#22d3ee","#ef4444","#fde047"];
+    const N = 80;
+    for (let i=0;i<N;i++){
+      const el = document.createElement("div");
+      el.className = "piece";
+      el.style.left = (Math.random()*100) + "%";
+      el.style.background = colors[i % colors.length];
+      el.style.transform = `translateY(-10px) rotate(${Math.random()*360}deg)`;
+      el.style.animationDuration = (1.8 + Math.random()*1.3) + "s";
+      el.style.animationDelay = (Math.random()*0.2) + "s";
+      confettiBox.appendChild(el);
+    }
+    // auto clear
+    setTimeout(()=> confettiBox.innerHTML="", 3000);
+  }
+
+  /** Draw winners */
+  let lastPool = [];
+  let lastSeed = "";
+  function draw(redraw=false){
+    showMsg("");
+    const { items, total, unique } = parseItems(input.value);
+    const want = Math.max(1, Number(nEl.value) || 1);
+    if (!items.length){
+      showMsg("候補がありません。入力してください。");
+      renderWinners([]);
+      return;
+    }
+    let pool = items.slice();
+    const allowDupWin = allowDupWinEl.checked;
+
+    if (!allowDupWin && want > new Set(pool).size){
+      showMsg(`当選人数（${want}）がユニーク候補数（${new Set(pool).size}）を超えています。自動的に ${new Set(pool).size} に調整しました。`, true);
+    }
+    const k = allowDupWin ? want : Math.min(want, new Set(pool).size);
+
+    // RNG selection
+    const seedStr = (seedEl.value ?? "").trim();
+    let rng = Math.random;
+    if (seedStr){
+      rng = xs32(hash32(seedStr));
+    } else {
+      // crypto-backed
+      rng = rand32;
+    }
+
+    // If redraw requested with same pool & same settings but without seed, keep previous RNG fresh
+    // Strategy: shuffle then pick first k
+    if (!allowDupWin){
+      pool = Array.from(new Set(pool));
+    }
+    shuffle(pool, rng);
+    let wins = pool.slice(0, k);
+
+    // if allowDupWin and want>pool.length, sample with replacement
+    if (allowDupWin && k > pool.length){
+      wins = [];
+      for (let i=0;i<k;i++){
+        wins.push(pool[Math.floor(rng()*pool.length)]);
+      }
+    }
+
+    renderWinners(wins);
+    const seedShown = seedStr ? `seed="${seedStr}"` : "seed: なし（非決定的）";
+    seedInfo.textContent = seedShown;
+
+    stat.textContent = `入力 ${total}｜ユニーク ${unique}｜当選 ${k}`;
+
+    // Save context for "redraw"
+    lastPool = items.slice();
+    lastSeed = seedStr;
+
+    launchConfetti();
+    save();
+  }
+
+  function renderWinners(arr){
+    winnersBox.innerHTML = "";
+    if (!arr.length){
+      winnersBox.hidden = true;
+      placeholder.hidden = false;
+      return;
+    }
+    placeholder.hidden = true;
+    winnersBox.hidden = false;
+    arr.forEach((w, idx)=>{
+      const span = document.createElement("span");
+      span.className = "chip";
+      span.textContent = `${idx+1}. ${w}`;
+      winnersBox.appendChild(span);
+    });
+  }
+
+  // Handlers
+  input.addEventListener("input", ()=> { refreshCounts(); save(); });
+  [nEl, trimEl, skipEmptyEl, dedupEl, allowDupWinEl, persistEl].forEach(el => el.addEventListener("change", ()=> { refreshCounts(); save(); }));
+  drawBtn.addEventListener("click", ()=> draw(false));
+  redrawBtn.addEventListener("click", ()=> draw(true));
+  clearBtn.addEventListener("click", ()=>{
+    input.value="";
+    refreshCounts();
+    renderWinners([]);
+    showMsg("");
+    seedInfo.textContent = "";
+    stat.textContent = "";
+    save();
+    input.focus();
+  });
+  copyBtn.addEventListener("click", async ()=>{
+    const chips = [...winnersBox.querySelectorAll(".chip")].map(c=>c.textContent);
+    const text = chips.join("\n");
+    if (!text){
+      showMsg("コピーする結果がありません。");
+      return;
+    }
+    try{
+      await navigator.clipboard.writeText(text);
+      showMsg("結果をクリップボードにコピーしました。", true);
+      setTimeout(()=> showMsg(""), 1500);
+    }catch{
+      showMsg("コピーに失敗しました。ブラウザの許可設定をご確認ください。");
+    }
+  });
+
+  // Keyboard shortcuts
+  document.addEventListener("keydown", (e)=>{
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && e.key === "Enter"){ e.preventDefault(); draw(false); }
+    if (mod && e.shiftKey && e.key === "Enter"){ e.preventDefault(); draw(true); }
+  });
+
+  // Init
+  load();
+  refreshCounts();
+})();
+</script>
+</body>
+</html>
